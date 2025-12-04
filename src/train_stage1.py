@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
+from torchvision.utils import save_image
 from glob import glob
 
 from omegaconf import OmegaConf
@@ -46,6 +47,23 @@ from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
 from utils.optim_utils import build_optimizer, build_scheduler
 
+class OneSampleImageFolder(ImageFolder):
+    """
+    ImageFolder that repeats the dataset N times per epoch.
+    """
+    def __init__(self, root, transform=None, repeat=100):
+        super().__init__(root, transform=transform)
+        self.repeat = repeat
+        self.original_len = len(self.samples)
+
+    def __len__(self):
+        # 总长度 = 原始样本数 * repeat
+        return self.original_len * self.repeat
+
+    def __getitem__(self, index):
+        # 对原始数据取模
+        index = index % self.original_len
+        return super().__getitem__(index)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-1 RAE with GAN and LPIPS losses.")
@@ -53,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-path", type=Path, required=True, help="Directory with ImageFolder structure.")
     parser.add_argument("--results-dir", type=str, default="results", help="Directory to store training outputs.")
     parser.add_argument("--image-size", type=int, default=256, help="Image resolution (assumes square images).")
+    parser.add_argument("--one-sample", action='store_true', help="Use one sample per epoch.")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")    
     parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
@@ -122,20 +141,35 @@ def calculate_adaptive_weight(
 def prepare_dataloader(
     data_path: Path,
     image_size: int,
+    one_sample: bool,
     batch_size: int,
     workers: int,
     rank: int,
     world_size: int,
 ) -> Tuple[DataLoader, DistributedSampler]:
     first_crop_size = 384 if image_size == 256 else int(image_size * 1.5)
-    transform = transforms.Compose(
-        [
-            transforms.Resize(first_crop_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomCrop(image_size),
+    
+    if one_sample:
+        # transform = transforms.Compose([
+        #     transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        #     transforms.CenterCrop(image_size),
+        #     transforms.ToTensor(),
+        # ])
+        transform = transforms.Compose([
+            transforms.Lambda(lambda img: transforms.functional.center_crop(img, min(img.size))),  # 裁剪成正方形
+            transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
-        ]
-    )
-    dataset = ImageFolder(str(data_path), transform=transform)
+        ])
+        dataset = OneSampleImageFolder(str(data_path), transform=transform)
+    else:
+        transform = transforms.Compose(
+            [
+                transforms.Resize(first_crop_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.RandomCrop(image_size),
+                transforms.ToTensor(),
+            ]
+        )
+        dataset = ImageFolder(str(data_path), transform=transform)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     loader = DataLoader(
         dataset,
@@ -268,6 +302,8 @@ def main():
         experiment_dir = os.path.join(args.results_dir, experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
+        images_dir = os.path.join(experiment_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.wandb:
@@ -315,7 +351,7 @@ def main():
         autocast_kwargs = dict(enabled=False)
 
     loader, sampler = prepare_dataloader(
-        args.data_path, args.image_size, batch_size, num_workers, rank, world_size
+        args.data_path, args.image_size, args.one_sample, batch_size, num_workers, rank, world_size
     )
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
@@ -504,6 +540,7 @@ def main():
                     f"[Epoch {epoch} | Step {global_step}] "
                     + ", ".join(f"{k}: {v:.4f}" for k, v in stats.items())
                 )
+                save_image(recon[0].detach().clamp(0.0, 1.0), os.path.join(images_dir, f"{global_step:07d}.png"))
                 if args.wandb:
                     wandb_utils.log(stats, step=global_step)
 
